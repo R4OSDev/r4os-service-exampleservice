@@ -25,3 +25,12 @@ Contract:
 - Standardargumente: `/RUN`
 - Zielpfad im Image: `C:\R4OS\SERVICES\EXSVC.R4X`
 
+Service-Loop seit 0.69.6:
+- `/RUN` verwendet den gemeinsamen SDK-Baustein `r4os.ServiceLoop`.
+- Endpoint-Wait, kontrollierter Stopcheck und begrenztes Queue-Draining sind
+  zentral; EXSVC besitzt keine Ein-Tick-Leerlaufpollschleife mehr.
+- Das Drainbudget ist auf die acht Endpointslots begrenzt und erzwingt keinen
+  Tick-Sleep zwischen bereits wartenden Requests.
+- `/BENCHMARK` erzeugt fuenf Samples mit acht Workern und je acht Requests,
+  bewahrt Queuealter sowie Ende-zu-Ende-Zeit je Request und schreibt die
+  numerischen Zeilen nach `C:\TEMP\SVCBENCH.TXT`.

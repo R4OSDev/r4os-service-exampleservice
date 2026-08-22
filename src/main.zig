@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4os = @import("r4os");
 
 const service_name = "EXSVC";
@@ -5,16 +6,63 @@ const service_path = "C:\\R4OS\\SERVICES\\EXSVC.R4X";
 const service_args = "/RUN";
 const selftest_arg = "/SELFTEST";
 const ping_arg = "/PING";
+const benchmark_arg = "/BENCHMARK";
 const inventory_restart_limit: u32 = 16;
 const inventory_would_block_retry_limit: u32 = 64;
+const benchmark_repetitions: usize = 5;
+const benchmark_workers: usize = 8;
+const benchmark_calls_per_worker: usize = 8;
+const benchmark_requests_per_sample: usize = benchmark_workers * benchmark_calls_per_worker;
+const benchmark_observation_count: usize = benchmark_repetitions * benchmark_requests_per_sample;
+const benchmark_idle_ms: u64 = 2000;
+const benchmark_report_path: [*:0]const u8 = "C:\\TEMP\\SVCBENCH.TXT";
 
 const op_echo: u16 = 1;
 const op_status: u16 = 2;
+const op_benchmark: u16 = 3;
+const benchmark_magic: u32 = 0x424D5653;
+
+const BenchmarkRequest = extern struct {
+    magic: u32 = benchmark_magic,
+    worker: u16 = 0,
+    sequence: u16 = 0,
+    sent_ns: u64 = 0,
+};
+
+const BenchmarkResponse = extern struct {
+    magic: u32 = benchmark_magic,
+    worker: u16 = 0,
+    sequence: u16 = 0,
+    sent_ns: u64 = 0,
+    received_ns: u64 = 0,
+};
+
+const BenchmarkObservation = struct {
+    queue_ns: u64 = 0,
+    e2e_ns: u64 = 0,
+    failure: i32 = 1,
+};
+
+const Distribution = struct {
+    minimum: u64 = 0,
+    p50: u64 = 0,
+    p95: u64 = 0,
+    p99: u64 = 0,
+    maximum: u64 = 0,
+    mean: u64 = 0,
+};
+
+var benchmark_sys: ?r4os.r4sys.Context = null;
+var benchmark_services: ?r4os.Services = null;
+var benchmark_ready: u32 = 0;
+var benchmark_release: u32 = 0;
+var benchmark_results: [benchmark_requests_per_sample]BenchmarkObservation = .{BenchmarkObservation{}} ** benchmark_requests_per_sample;
 
 const ServiceStats = struct {
     requests: u32 = 0,
     echoes: u32 = 0,
     status: u32 = 0,
+    benchmarks: u32 = 0,
     bad_ops: u32 = 0,
 };
 
@@ -23,6 +71,7 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     const services = app.services() orelse return r4os.abi.service_api_result_invalid;
     if (hasArg(app.args(), selftest_arg)) return runSelfTest(&ctx, &services);
     if (hasArg(app.args(), ping_arg)) return runPingClient(&ctx, &services);
+    if (hasArg(app.args(), benchmark_arg)) return runBenchmark(&ctx, &services);
     return runService(&ctx, &services);
 }
 
@@ -48,17 +97,17 @@ fn runService(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i3
 
     var owned_endpoint = endpoint.?;
     var stats: ServiceStats = .{};
-    while (!ctx.programShouldClose()) {
-        const wait = owned_endpoint.wait(r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(1_000_000)));
-        switch (wait) {
-            .ready => {
-                const rc = handleRequest(&owned_endpoint, &stats);
-                if (rc < 0) {
-                    _ = owned_endpoint.unregister();
-                    return rc;
-                }
+    var service_loop = r4os.ServiceLoop.init(ctx.*, owned_endpoint.raw, .{});
+    while (true) {
+        switch (service_loop.wait(null)) {
+            .requests => |pending| {
+                const rc = service_loop.drain(pending, handleRequest, .{ ctx, &owned_endpoint, &stats });
+                if (rc >= 0) continue;
+                _ = owned_endpoint.unregister();
+                return rc;
             },
-            .timed_out => {},
+            .idle, .deadline => {},
+            .stop => break,
             .failure => |raw| {
                 _ = owned_endpoint.unregister();
                 return raw;
@@ -66,12 +115,13 @@ fn runService(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i3
         }
     }
 
+    service_loop.report(service_name);
     _ = owned_endpoint.unregister();
     ctx.println("EXSVC stopped cleanly");
     return 0;
 }
 
-fn handleRequest(endpoint: *r4os.ServiceEndpoint, stats: *ServiceStats) i32 {
+fn handleRequest(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint, stats: *ServiceStats) i32 {
     var payload: [r4os.abi.service_api_max_payload]u8 = undefined;
     const message = switch (endpoint.recv(payload[0..])) {
         .message => |value| value,
@@ -87,6 +137,24 @@ fn handleRequest(endpoint: *r4os.ServiceEndpoint, stats: *ServiceStats) i32 {
     if (message.header.op == op_status) {
         stats.status +%= 1;
         return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_ok, "EXSVC OK");
+    }
+    if (message.header.op == op_benchmark) {
+        if (message.bytes != @sizeOf(BenchmarkRequest))
+            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_invalid, "SIZE");
+        var request: BenchmarkRequest = undefined;
+        @memcpy(std.mem.asBytes(&request), payload[0..@sizeOf(BenchmarkRequest)]);
+        if (request.magic != benchmark_magic)
+            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_invalid, "MAGIC");
+        const received_ns = ctx.monotonicNanoseconds() orelse
+            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_invalid, "CLOCK");
+        stats.benchmarks +%= 1;
+        const response = BenchmarkResponse{
+            .worker = request.worker,
+            .sequence = request.sequence,
+            .sent_ns = request.sent_ns,
+            .received_ns = received_ns,
+        };
+        return endpoint.replyTyped(BenchmarkResponse, message.header.request_id, r4os.abi.service_api_result_ok, &response);
     }
     stats.bad_ops +%= 1;
     return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
@@ -110,6 +178,208 @@ fn runPingClient(ctx: *const r4os.r4sys.Context, services: *const r4os.Services)
     }
     ctx.println("EXSVC ping: OK");
     return 0;
+}
+
+fn runBenchmark(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i32 {
+    if (!ctx.hasFn("thread_create_handle") or
+        !ctx.hasFn("thread_handle_join") or
+        !ctx.hasFn("monotonic_clock") or
+        !ctx.hasFn("service_start") or
+        !ctx.hasFn("service_call")) return benchmarkFail(ctx, 1);
+
+    cleanupService(ctx);
+    var info: r4os.abi.ServiceInfo = .{};
+    var rc = ctx.serviceInstall(service_name, service_path, service_args, r4os.abi.service_start_manual, "Example service", &info);
+    if (rc != r4os.abi.service_api_result_ok) return benchmarkFail(ctx, 2);
+    rc = ctx.serviceStart(service_name, &info);
+    if (rc != r4os.abi.service_api_result_ok or info.state != r4os.abi.service_state_running)
+        return benchmarkFail(ctx, 3);
+
+    var probe = waitServiceOpen(ctx, services, 120) orelse return benchmarkFail(ctx, 4);
+    _ = probe.close();
+    benchmark_sys = ctx.*;
+    benchmark_services = services.*;
+    ctx.sleepTicks(ctx.ticksFromMilliseconds(benchmark_idle_ms));
+
+    printBenchmarkMetadata(ctx);
+    var all_queue: [benchmark_observation_count]u64 = .{0} ** benchmark_observation_count;
+    var all_e2e: [benchmark_observation_count]u64 = .{0} ** benchmark_observation_count;
+    var all_offset: usize = 0;
+
+    var sample: usize = 0;
+    while (sample < benchmark_repetitions) : (sample += 1) {
+        benchmark_results = .{BenchmarkObservation{}} ** benchmark_requests_per_sample;
+        @atomicStore(u32, &benchmark_ready, 0, .release);
+        @atomicStore(u32, &benchmark_release, 0, .release);
+
+        var handles: [benchmark_workers]r4os.abi.ProgramJoinHandle = .{r4os.abi.ProgramJoinHandle{}} ** benchmark_workers;
+        var created: usize = 0;
+        while (created < handles.len) : (created += 1) {
+            rc = ctx.threadCreateHandle(benchmarkWorkerMain, created, 0, 0, &handles[created]);
+            if (rc != r4os.abi.thread_ok) {
+                @atomicStore(u32, &benchmark_release, 1, .release);
+                joinBenchmarkWorkers(ctx, handles[0..created]);
+                return benchmarkFail(ctx, 5);
+            }
+        }
+
+        var ready_rounds: u32 = 0;
+        while (@atomicLoad(u32, &benchmark_ready, .acquire) != benchmark_workers and ready_rounds < 100_000) : (ready_rounds += 1)
+            ctx.taskYield();
+        if (@atomicLoad(u32, &benchmark_ready, .acquire) != benchmark_workers) {
+            @atomicStore(u32, &benchmark_release, 1, .release);
+            joinBenchmarkWorkers(ctx, handles[0..]);
+            return benchmarkFail(ctx, 6);
+        }
+
+        const started_ns = ctx.monotonicNanoseconds() orelse {
+            @atomicStore(u32, &benchmark_release, 1, .release);
+            joinBenchmarkWorkers(ctx, handles[0..]);
+            return benchmarkFail(ctx, 7);
+        };
+        @atomicStore(u32, &benchmark_release, 1, .release);
+
+        var worker_failures: u32 = 0;
+        for (handles[0..]) |*handle| {
+            var exit_code: i32 = -1;
+            if (ctx.threadHandleJoin(handle, r4os.abi.thread_wait_forever, &exit_code) != r4os.abi.thread_ok or exit_code != 0)
+                worker_failures +%= 1;
+        }
+        const completed_ns = ctx.monotonicNanoseconds() orelse return benchmarkFail(ctx, 8);
+        const elapsed_ns = completed_ns -| started_ns;
+
+        var queue_values: [benchmark_requests_per_sample]u64 = .{0} ** benchmark_requests_per_sample;
+        var e2e_values: [benchmark_requests_per_sample]u64 = .{0} ** benchmark_requests_per_sample;
+        var observation_failures: u32 = 0;
+        for (benchmark_results, 0..) |observation, index| {
+            const worker = index / benchmark_calls_per_worker;
+            const sequence = index % benchmark_calls_per_worker;
+            printBenchmarkRaw(ctx, sample, worker, sequence, observation);
+            if (observation.failure != 0) observation_failures +%= 1;
+            queue_values[index] = observation.queue_ns;
+            e2e_values[index] = observation.e2e_ns;
+            all_queue[all_offset + index] = observation.queue_ns;
+            all_e2e[all_offset + index] = observation.e2e_ns;
+        }
+        if (worker_failures != 0 or observation_failures != 0 or elapsed_ns == 0)
+            return benchmarkFail(ctx, 9);
+
+        const queue_distribution = summarize(queue_values[0..]);
+        const e2e_distribution = summarize(e2e_values[0..]);
+        const throughput = requestsPerSecond(benchmark_requests_per_sample, elapsed_ns);
+        printBenchmarkSample(ctx, sample, elapsed_ns, throughput, queue_distribution, e2e_distribution);
+        all_offset += benchmark_requests_per_sample;
+        if (sample + 1 < benchmark_repetitions) ctx.sleepTicks(ctx.ticksFromMilliseconds(100));
+    }
+
+    printBenchmarkDistribution(ctx, summarize(all_queue[0..all_offset]), summarize(all_e2e[0..all_offset]));
+    rc = ctx.serviceStop(service_name, &info, 80);
+    if (rc != r4os.abi.service_api_result_ok or info.state != r4os.abi.service_state_stopped)
+        return benchmarkFail(ctx, 10);
+    rc = ctx.serviceRemove(service_name);
+    if (rc != r4os.abi.service_api_result_ok) return benchmarkFail(ctx, 11);
+    benchmark_sys = null;
+    benchmark_services = null;
+    emitBenchmarkLine(ctx, "SVCBENCHOK|1|1", false);
+    return 0;
+}
+
+fn benchmarkWorkerMain(raw_worker: u64) callconv(.c) i32 {
+    var sys = benchmark_sys orelse return 20;
+    const services = benchmark_services orelse return 21;
+    const worker: usize = @intCast(raw_worker);
+    if (worker >= benchmark_workers) return 22;
+
+    var connection = switch (services.open(service_name)) {
+        .connection => |value| value,
+        .failure => {
+            markBenchmarkWorkerFailure(worker, 23);
+            _ = @atomicRmw(u32, &benchmark_ready, .Add, 1, .acq_rel);
+            return 23;
+        },
+    };
+    _ = @atomicRmw(u32, &benchmark_ready, .Add, 1, .acq_rel);
+    while (@atomicLoad(u32, &benchmark_release, .acquire) == 0) sys.taskYield();
+
+    var sequence: usize = 0;
+    while (sequence < benchmark_calls_per_worker) : (sequence += 1) {
+        const result_index = worker * benchmark_calls_per_worker + sequence;
+        const sent_ns = sys.monotonicNanoseconds() orelse {
+            benchmark_results[result_index].failure = 24;
+            continue;
+        };
+        const request = BenchmarkRequest{
+            .worker = @intCast(worker),
+            .sequence = @intCast(sequence),
+            .sent_ns = sent_ns,
+        };
+        const called = connection.callTyped(
+            BenchmarkRequest,
+            BenchmarkResponse,
+            op_benchmark,
+            &request,
+            r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(2_000_000_000)),
+        );
+        const response = switch (called) {
+            .value => |value| value,
+            .timed_out => {
+                benchmark_results[result_index].failure = 25;
+                continue;
+            },
+            .remote_failure => |raw| {
+                benchmark_results[result_index].failure = raw;
+                continue;
+            },
+            .failure => |raw| {
+                benchmark_results[result_index].failure = raw;
+                continue;
+            },
+        };
+        const completed_ns = sys.monotonicNanoseconds() orelse {
+            benchmark_results[result_index].failure = 26;
+            continue;
+        };
+        if (response.magic != benchmark_magic or
+            response.worker != worker or
+            response.sequence != sequence or
+            response.sent_ns != sent_ns or
+            response.received_ns < sent_ns or
+            completed_ns < response.received_ns)
+        {
+            benchmark_results[result_index].failure = 27;
+            continue;
+        }
+        benchmark_results[result_index] = .{
+            .queue_ns = response.received_ns - sent_ns,
+            .e2e_ns = completed_ns - sent_ns,
+            .failure = 0,
+        };
+    }
+    _ = connection.close();
+    return 0;
+}
+
+fn markBenchmarkWorkerFailure(worker: usize, failure: i32) void {
+    const first = worker * benchmark_calls_per_worker;
+    for (benchmark_results[first .. first + benchmark_calls_per_worker]) |*observation|
+        observation.failure = failure;
+}
+
+fn joinBenchmarkWorkers(ctx: *const r4os.r4sys.Context, handles: []r4os.abi.ProgramJoinHandle) void {
+    for (handles) |*handle| {
+        var exit_code: i32 = -1;
+        _ = ctx.threadHandleJoin(handle, r4os.abi.thread_wait_forever, &exit_code);
+    }
+}
+
+fn benchmarkFail(ctx: *const r4os.r4sys.Context, code: u32) i32 {
+    var line_buffer: [64]u8 = undefined;
+    const line = std.fmt.bufPrint(line_buffer[0..], "SVCBENCHFAIL|1|{d}", .{code}) catch "SVCBENCHFAIL|1|0";
+    emitBenchmarkLine(ctx, line, false);
+    benchmark_sys = null;
+    benchmark_services = null;
+    cleanupService(ctx);
+    return 1;
 }
 
 fn runSelfTest(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i32 {
@@ -194,6 +464,141 @@ fn callStatus(connection: *r4os.ServiceConnection) bool {
         else => true,
     }) return false;
     return bytesEq(response[0..8], "EXSVC OK");
+}
+
+fn printBenchmarkMetadata(ctx: *const r4os.r4sys.Context) void {
+    var line_buffer: [160]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        line_buffer[0..],
+        "SVCBENCHM|1|{d}|{d}|{d}|{d}|{d}|{d}",
+        .{ benchmark_repetitions, benchmark_workers, benchmark_calls_per_worker, benchmark_requests_per_sample, benchmark_observation_count, benchmark_idle_ms },
+    ) catch return;
+    emitBenchmarkLine(ctx, line, true);
+}
+
+fn printBenchmarkRaw(
+    ctx: *const r4os.r4sys.Context,
+    sample: usize,
+    worker: usize,
+    sequence: usize,
+    observation: BenchmarkObservation,
+) void {
+    var line_buffer: [192]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        line_buffer[0..],
+        "SVCBENCHR|1|{d}|{d}|{d}|{d}|{d}|{d}",
+        .{ sample + 1, worker + 1, sequence + 1, observation.queue_ns, observation.e2e_ns, observation.failure },
+    ) catch return;
+    emitBenchmarkLine(ctx, line, false);
+}
+
+fn printBenchmarkSample(
+    ctx: *const r4os.r4sys.Context,
+    sample: usize,
+    elapsed_ns: u64,
+    throughput: u64,
+    queue: Distribution,
+    e2e: Distribution,
+) void {
+    var line_buffer: [384]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        line_buffer[0..],
+        "SVCBENCHS|1|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}",
+        .{
+            sample + 1,
+            benchmark_requests_per_sample,
+            elapsed_ns,
+            throughput,
+            queue.minimum,
+            queue.p50,
+            queue.p95,
+            queue.p99,
+            queue.maximum,
+            queue.mean,
+            e2e.minimum,
+            e2e.p50,
+            e2e.p95,
+            e2e.p99,
+            e2e.maximum,
+            e2e.mean,
+        },
+    ) catch return;
+    emitBenchmarkLine(ctx, line, false);
+}
+
+fn printBenchmarkDistribution(ctx: *const r4os.r4sys.Context, queue: Distribution, e2e: Distribution) void {
+    var line_buffer: [320]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        line_buffer[0..],
+        "SVCBENCHD|1|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}",
+        .{
+            benchmark_observation_count,
+            queue.minimum,
+            queue.p50,
+            queue.p95,
+            queue.p99,
+            queue.maximum,
+            queue.mean,
+            e2e.minimum,
+            e2e.p50,
+            e2e.p95,
+            e2e.p99,
+            e2e.maximum,
+            e2e.mean,
+        },
+    ) catch return;
+    emitBenchmarkLine(ctx, line, false);
+}
+
+fn emitBenchmarkLine(ctx: *const r4os.r4sys.Context, line: []const u8, reset: bool) void {
+    ctx.println(line);
+    var file_buffer: [514]u8 = undefined;
+    if (line.len + 2 > file_buffer.len) return;
+    @memcpy(file_buffer[0..line.len], line);
+    file_buffer[line.len] = '\r';
+    file_buffer[line.len + 1] = '\n';
+    const bytes = file_buffer[0 .. line.len + 2];
+    _ = if (reset) ctx.fileWrite(benchmark_report_path, bytes) else ctx.fileAppend(benchmark_report_path, bytes);
+}
+
+fn requestsPerSecond(request_count: usize, elapsed_ns: u64) u64 {
+    if (request_count == 0 or elapsed_ns == 0) return 0;
+    return @intCast((@as(u128, request_count) * 1_000_000_000) / elapsed_ns);
+}
+
+fn summarize(values: []const u64) Distribution {
+    if (values.len == 0 or values.len > benchmark_observation_count) return .{};
+    var sorted: [benchmark_observation_count]u64 = .{0} ** benchmark_observation_count;
+    var sum: u128 = 0;
+    for (values, 0..) |value, index| {
+        sorted[index] = value;
+        sum += value;
+    }
+    insertionSort(sorted[0..values.len]);
+    return .{
+        .minimum = sorted[0],
+        .p50 = nearestRank(sorted[0..values.len], 50),
+        .p95 = nearestRank(sorted[0..values.len], 95),
+        .p99 = nearestRank(sorted[0..values.len], 99),
+        .maximum = sorted[values.len - 1],
+        .mean = @intCast(sum / values.len),
+    };
+}
+
+fn insertionSort(values: []u64) void {
+    var index: usize = 1;
+    while (index < values.len) : (index += 1) {
+        const value = values[index];
+        var position = index;
+        while (position > 0 and values[position - 1] > value) : (position -= 1)
+            values[position] = values[position - 1];
+        values[position] = value;
+    }
+}
+
+fn nearestRank(sorted: []const u64, percentile: usize) u64 {
+    const rank = (percentile * sorted.len + 99) / 100;
+    return sorted[@max(rank, 1) - 1];
 }
 
 fn cleanupService(ctx: *const r4os.r4sys.Context) void {
