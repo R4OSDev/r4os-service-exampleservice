@@ -7,6 +7,8 @@ const service_args = "/RUN";
 const selftest_arg = "/SELFTEST";
 const ping_arg = "/PING";
 const benchmark_arg = "/BENCHMARK";
+const benchmark_keep_arg = "/KEEP";
+const benchmark_keep_service_arg = "/BENCHMARKKEEP";
 const inventory_restart_limit: u32 = 16;
 const inventory_would_block_retry_limit: u32 = 64;
 const benchmark_repetitions: usize = 5;
@@ -20,7 +22,12 @@ const benchmark_report_path: [*:0]const u8 = "C:\\TEMP\\SVCBENCH.TXT";
 const op_echo: u16 = 1;
 const op_status: u16 = 2;
 const op_benchmark: u16 = 3;
+const op_completion_batch: u16 = 4;
+const op_no_reply: u16 = 5;
 const benchmark_magic: u32 = 0x424D5653;
+const completion_magic: u32 = 0x504D4F43;
+const completion_batch_size: usize = r4os.abi.service_api_endpoint_queue_depth;
+const completion_request_count: usize = completion_batch_size + 1;
 
 const BenchmarkRequest = extern struct {
     magic: u32 = benchmark_magic,
@@ -35,6 +42,24 @@ const BenchmarkResponse = extern struct {
     sequence: u16 = 0,
     sent_ns: u64 = 0,
     received_ns: u64 = 0,
+};
+
+const CompletionRequest = extern struct {
+    magic: u32 = completion_magic,
+    client_index: u32 = 0,
+};
+
+const CompletionResponse = extern struct {
+    magic: u32 = completion_magic,
+    client_index: u32 = 0,
+    arrival_order: u32 = 0,
+    reply_order: u32 = 0,
+};
+
+const PendingCompletion = struct {
+    request_id: u32 = 0,
+    client_index: u32 = 0,
+    arrival_order: u32 = 0,
 };
 
 const BenchmarkObservation = struct {
@@ -63,6 +88,10 @@ const ServiceStats = struct {
     echoes: u32 = 0,
     status: u32 = 0,
     benchmarks: u32 = 0,
+    completion_seen: u32 = 0,
+    completion_pending: usize = 0,
+    completion_batch_released: bool = false,
+    completion_requests: [completion_batch_size]PendingCompletion = .{PendingCompletion{}} ** completion_batch_size,
     bad_ops: u32 = 0,
 };
 
@@ -71,7 +100,13 @@ pub fn r4_app_main(app: *r4os.App) i32 {
     const services = app.services() orelse return r4os.abi.service_api_result_invalid;
     if (hasArg(app.args(), selftest_arg)) return runSelfTest(&ctx, &services);
     if (hasArg(app.args(), ping_arg)) return runPingClient(&ctx, &services);
-    if (hasArg(app.args(), benchmark_arg)) return runBenchmark(&ctx, &services);
+    if (hasArg(app.args(), benchmark_arg) or hasArg(app.args(), benchmark_keep_service_arg)) {
+        return runBenchmark(
+            &ctx,
+            &services,
+            hasArg(app.args(), benchmark_keep_arg) or hasArg(app.args(), benchmark_keep_service_arg),
+        );
+    }
     return runService(&ctx, &services);
 }
 
@@ -156,6 +191,57 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint
         };
         return endpoint.replyTyped(BenchmarkResponse, message.header.request_id, r4os.abi.service_api_result_ok, &response);
     }
+    if (message.header.op == op_completion_batch) {
+        if (message.bytes != @sizeOf(CompletionRequest))
+            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_invalid, "SIZE");
+        var request: CompletionRequest = undefined;
+        @memcpy(std.mem.asBytes(&request), payload[0..@sizeOf(CompletionRequest)]);
+        if (request.magic != completion_magic or request.client_index >= completion_request_count)
+            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_invalid, "REQUEST");
+
+        const arrival_order = stats.completion_seen;
+        stats.completion_seen +%= 1;
+        if (stats.completion_batch_released) {
+            const response = CompletionResponse{
+                .client_index = request.client_index,
+                .arrival_order = arrival_order,
+                .reply_order = arrival_order,
+            };
+            return endpoint.replyTyped(CompletionResponse, message.header.request_id, r4os.abi.service_api_result_ok, &response);
+        }
+        if (stats.completion_pending >= stats.completion_requests.len)
+            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_busy, "FULL");
+        stats.completion_requests[stats.completion_pending] = .{
+            .request_id = message.header.request_id,
+            .client_index = request.client_index,
+            .arrival_order = arrival_order,
+        };
+        stats.completion_pending += 1;
+        if (stats.completion_pending < completion_batch_size) return 0;
+
+        // Keep all eight endpoint slots occupied long enough for the ninth
+        // synchronous worker to enter FIFO admission, then answer the batch
+        // in reverse arrival order to exercise request-specific completion.
+        ctx.sleepTicks(ctx.ticksFromMilliseconds(50));
+        var reply_order: u32 = 0;
+        var pending_index = stats.completion_pending;
+        while (pending_index > 0) {
+            pending_index -= 1;
+            const pending = stats.completion_requests[pending_index];
+            const response = CompletionResponse{
+                .client_index = pending.client_index,
+                .arrival_order = pending.arrival_order,
+                .reply_order = reply_order,
+            };
+            const rc = endpoint.replyTyped(CompletionResponse, pending.request_id, r4os.abi.service_api_result_ok, &response);
+            if (rc < 0) return rc;
+            reply_order += 1;
+        }
+        stats.completion_pending = 0;
+        stats.completion_batch_released = true;
+        return 0;
+    }
+    if (message.header.op == op_no_reply) return 0;
     stats.bad_ops +%= 1;
     return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
 }
@@ -180,7 +266,7 @@ fn runPingClient(ctx: *const r4os.r4sys.Context, services: *const r4os.Services)
     return 0;
 }
 
-fn runBenchmark(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i32 {
+fn runBenchmark(ctx: *const r4os.r4sys.Context, services: *const r4os.Services, keep_endpoint: bool) i32 {
     if (!ctx.hasFn("thread_create_handle") or
         !ctx.hasFn("thread_handle_join") or
         !ctx.hasFn("monotonic_clock") or
@@ -196,6 +282,7 @@ fn runBenchmark(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) 
         return benchmarkFail(ctx, 3);
 
     var probe = waitServiceOpen(ctx, services, 120) orelse return benchmarkFail(ctx, 4);
+    if (!runCompletionScenario(ctx, &probe)) return benchmarkFail(ctx, 12);
     _ = probe.close();
     benchmark_sys = ctx.*;
     benchmark_services = services.*;
@@ -273,6 +360,12 @@ fn runBenchmark(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) 
     }
 
     printBenchmarkDistribution(ctx, summarize(all_queue[0..all_offset]), summarize(all_e2e[0..all_offset]));
+    if (keep_endpoint) {
+        benchmark_sys = null;
+        benchmark_services = null;
+        emitBenchmarkLine(ctx, "SVCBENCHOK|1|1", false);
+        return 0;
+    }
     rc = ctx.serviceStop(service_name, &info, 80);
     if (rc != r4os.abi.service_api_result_ok or info.state != r4os.abi.service_state_stopped)
         return benchmarkFail(ctx, 10);
@@ -409,6 +502,7 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i
     var connection = waitServiceOpen(ctx, services, 120) orelse return fail(ctx, "open");
     if (!callEcho(&connection, "EXSVC-0.22.6")) return fail(ctx, "echo");
     if (!callStatus(&connection)) return fail(ctx, "status");
+    if (!runCompletionScenario(ctx, &connection)) return fail(ctx, "request-completion");
     _ = connection.close();
 
     rc = ctx.serviceRestart(service_name, &info);
@@ -419,9 +513,32 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i
     connection = waitServiceOpen(ctx, services, 120) orelse return fail(ctx, "open-after-restart");
     if (!callEcho(&connection, "RESTART-OK")) return fail(ctx, "echo-after-restart");
 
+    var stop_header: r4os.abi.ServiceMessageHeader = .{};
+    var stop_response: [1]u8 = .{0};
+    var stop_request_id: u32 = 0;
+    const stop_submit = ctx.ioServiceCall(
+        connection.raw,
+        op_no_reply,
+        "STOP",
+        &stop_header,
+        stop_response[0..],
+        r4os.abi.io_wait_forever,
+        0,
+        &stop_request_id,
+    );
+    if (stop_submit != r4os.abi.io_ok or stop_request_id == 0) return fail(ctx, "stop-wait-submit");
+    ctx.sleepTicks(ctx.ticksFromMilliseconds(20));
+
     rc = ctx.serviceStop(service_name, &info, 80);
     if (rc != r4os.abi.service_api_result_ok or info.state != r4os.abi.service_state_stopped) return failCode(ctx, "stop", rc);
     if (!waitInstanceGone(ctx, second_instance, 120)) return fail(ctx, "second-instance-stale");
+    var stop_io: r4os.abi.ProgramIoInfo = .{};
+    const stop_wait = ctx.ioWait(stop_request_id, r4os.abi.io_wait_forever, &stop_io);
+    const stop_result_ok = stop_io.result == r4os.abi.service_api_result_bad_handle or
+        stop_io.result == r4os.abi.service_api_result_not_running;
+    _ = ctx.ioClose(stop_request_id);
+    if (stop_wait != r4os.abi.io_ok or stop_io.state != r4os.abi.io_state_completed or !stop_result_ok)
+        return failCode(ctx, "stop-wait-result", stop_io.result);
 
     var stale_response: [16]u8 = undefined;
     const stale = connection.call(op_status, "X", stale_response[0..], r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(5_000_000)));
@@ -444,6 +561,91 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i
 
     ctx.println("EXSVC selftest: OK");
     return 0;
+}
+
+fn runCompletionScenario(ctx: *const r4os.r4sys.Context, connection: *r4os.ServiceConnection) bool {
+    var requests: [completion_request_count]CompletionRequest = .{CompletionRequest{}} ** completion_request_count;
+    var responses: [completion_request_count]CompletionResponse = .{CompletionResponse{}} ** completion_request_count;
+    var headers: [completion_request_count]r4os.abi.ServiceMessageHeader = .{r4os.abi.ServiceMessageHeader{}} ** completion_request_count;
+    var io_ids: [completion_request_count]u32 = .{0} ** completion_request_count;
+    var submitted: usize = 0;
+    while (submitted < completion_request_count) : (submitted += 1) {
+        requests[submitted].client_index = @intCast(submitted);
+        const rc = ctx.ioServiceCall(
+            connection.raw,
+            op_completion_batch,
+            std.mem.asBytes(&requests[submitted]),
+            &headers[submitted],
+            std.mem.asBytes(&responses[submitted]),
+            ctx.ticksFromMilliseconds(2000),
+            0,
+            &io_ids[submitted],
+        );
+        if (rc != r4os.abi.io_ok or io_ids[submitted] == 0) break;
+    }
+    if (submitted != completion_request_count) {
+        cleanupService(ctx);
+        closeCompletionRequests(ctx, io_ids[0..submitted]);
+        return false;
+    }
+
+    var ok = true;
+    var index: usize = 0;
+    while (index < completion_request_count) : (index += 1) {
+        var io_info: r4os.abi.ProgramIoInfo = .{};
+        const waited = ctx.ioWait(io_ids[index], ctx.ticksFromMilliseconds(3000), &io_info);
+        if (waited != r4os.abi.io_ok or io_info.state != r4os.abi.io_state_completed) {
+            cleanupService(ctx);
+            closeCompletionRequests(ctx, io_ids[index..]);
+            return false;
+        }
+        if (io_info.result != @as(i32, @intCast(@sizeOf(CompletionResponse))) or
+            headers[index].status != r4os.abi.service_api_result_ok or
+            responses[index].magic != completion_magic or
+            responses[index].client_index != @as(u32, @intCast(index))) ok = false;
+        _ = ctx.ioClose(io_ids[index]);
+    }
+
+    var arrivals: [completion_request_count]bool = .{false} ** completion_request_count;
+    var replies: [completion_request_count]bool = .{false} ** completion_request_count;
+    for (responses) |response| {
+        if (response.arrival_order >= completion_request_count or response.reply_order >= completion_request_count) {
+            ok = false;
+            continue;
+        }
+        const arrival: usize = @intCast(response.arrival_order);
+        const reply: usize = @intCast(response.reply_order);
+        if (arrivals[arrival] or replies[reply]) ok = false;
+        arrivals[arrival] = true;
+        replies[reply] = true;
+        if (arrival < completion_batch_size) {
+            if (response.arrival_order + response.reply_order != completion_batch_size - 1) ok = false;
+        } else if (response.arrival_order != completion_batch_size or response.reply_order != completion_batch_size) {
+            ok = false;
+        }
+    }
+
+    var timeout_response: [1]u8 = .{0};
+    const timed = connection.call(
+        op_no_reply,
+        "TIMEOUT",
+        timeout_response[0..],
+        r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(20_000_000)),
+    );
+    switch (timed) {
+        .timed_out => {},
+        else => ok = false,
+    }
+    return ok;
+}
+
+fn closeCompletionRequests(ctx: *const r4os.r4sys.Context, request_ids: []const u32) void {
+    for (request_ids) |request_id| {
+        if (request_id == 0) continue;
+        var info: r4os.abi.ProgramIoInfo = .{};
+        _ = ctx.ioWait(request_id, ctx.ticksFromMilliseconds(500), &info);
+        _ = ctx.ioClose(request_id);
+    }
 }
 
 fn callEcho(connection: *r4os.ServiceConnection, payload: []const u8) bool {
