@@ -98,9 +98,20 @@ const ServiceStats = struct {
 pub fn r4_app_main(app: *r4os.App) i32 {
     const ctx = app.system();
     const services = app.services() orelse return r4os.abi.service_api_result_invalid;
+    const benchmark_requested = hasArg(app.args(), benchmark_arg) or hasArg(app.args(), benchmark_keep_service_arg);
+    // Service-class binaries may only be launched interactively through the
+    // Terminal's explicit selftest policy. The combined test-harness form
+    // keeps the benchmark a console-owned process without changing /RUN.
+    if (benchmark_requested and hasArg(app.args(), selftest_arg)) {
+        return runBenchmark(
+            &ctx,
+            &services,
+            hasArg(app.args(), benchmark_keep_arg) or hasArg(app.args(), benchmark_keep_service_arg),
+        );
+    }
     if (hasArg(app.args(), selftest_arg)) return runSelfTest(&ctx, &services);
     if (hasArg(app.args(), ping_arg)) return runPingClient(&ctx, &services);
-    if (hasArg(app.args(), benchmark_arg) or hasArg(app.args(), benchmark_keep_service_arg)) {
+    if (benchmark_requested) {
         return runBenchmark(
             &ctx,
             &services,
@@ -502,6 +513,7 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i
     var connection = waitServiceOpen(ctx, services, 120) orelse return fail(ctx, "open");
     if (!callEcho(&connection, "EXSVC-0.22.6")) return fail(ctx, "echo");
     if (!callStatus(&connection)) return fail(ctx, "status");
+    if (!runPayloadLifecycleScenario(ctx, &connection)) return fail(ctx, "payload-lifecycle");
     if (!runCompletionScenario(ctx, &connection)) return fail(ctx, "request-completion");
     _ = connection.close();
 
@@ -650,12 +662,51 @@ fn closeCompletionRequests(ctx: *const r4os.r4sys.Context, request_ids: []const 
 
 fn callEcho(connection: *r4os.ServiceConnection, payload: []const u8) bool {
     var response: [64]u8 = undefined;
-    const call = connection.call(op_echo, payload, response[0..], r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(120_000_000)));
+    return callEchoInto(connection, payload, response[0..]);
+}
+
+fn callEchoInto(connection: *r4os.ServiceConnection, payload: []const u8, response: []u8) bool {
+    const call = connection.call(op_echo, payload, response, r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(120_000_000)));
     if (switch (call) {
-        .response => |value| value.bytes != payload.len,
+        .response => |value| value.bytes != payload.len or value.header.payload_len != payload.len,
         else => true,
     }) return false;
     return bytesEq(response[0..payload.len], payload);
+}
+
+fn runPayloadLifecycleScenario(ctx: *const r4os.r4sys.Context, connection: *r4os.ServiceConnection) bool {
+    var response: [r4os.abi.service_api_max_payload]u8 = undefined;
+    if (!callEchoInto(connection, "", response[0..])) return false;
+    if (!callEchoInto(connection, "S", response[0..])) return false;
+
+    var maximum: [r4os.abi.service_api_max_payload]u8 = undefined;
+    for (&maximum, 0..) |*byte, index| byte.* = @truncate(index *% 131 +% 17);
+    if (!callEchoInto(connection, maximum[0..], response[0..])) return false;
+
+    // Der naechste Ein-Byte-Request nutzt wieder den ersten freien Slot. Ein
+    // alter 4096-Byte-Payload darf ueber die neue Laenge nicht sichtbar sein.
+    if (!callEchoInto(connection, "R", response[0..])) return false;
+
+    var medium: [257]u8 = undefined;
+    for (&medium, 0..) |*byte, index| byte.* = @truncate(index *% 29 +% 3);
+    var too_small: [1]u8 = .{0xCC};
+    var header: r4os.abi.ServiceMessageHeader = .{};
+    const small_result = ctx.serviceCall(
+        connection.raw,
+        op_echo,
+        medium[0..],
+        &header,
+        too_small[0..],
+        ctx.ticksFromMilliseconds(120),
+    );
+    if (small_result != r4os.abi.service_api_result_buffer_too_small or
+        header.magic != r4os.abi.service_api_magic or
+        header.payload_len != medium.len or
+        too_small[0] != 0xCC) return false;
+
+    // Auch der Buffer-too-small-Abbruch muss den Slot freigeben, ohne dass
+    // die 257 alten Bytes in der folgenden leeren Antwort sichtbar werden.
+    return callEchoInto(connection, "", response[0..]);
 }
 
 fn callStatus(connection: *r4os.ServiceConnection) bool {

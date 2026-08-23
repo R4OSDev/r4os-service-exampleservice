@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.2`
+- Version: `0.1.4`
 - Image target: `/R4OS/SERVICES/EXSVC.R4X`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -22,7 +22,10 @@ forced tick per request.
 The explicit `/BENCHMARK` launch mode runs five 8-by-8 concurrent request
 samples after a two-second idle window. It records every queue-age and
 end-to-end observation plus sample and overall distributions in
-`C:\TEMP\SVCBENCH.TXT`. `/SELFTEST` and `/PING` remain the functional modes.
+`C:\TEMP\SVCBENCH.TXT`. The headless Terminal harness uses
+`/SELFTEST /BENCHMARK /KEEP` so the service-class artifact runs under the
+Terminal's explicit selftest launch policy. `/SELFTEST` and `/PING` remain the
+functional modes.
 
 ## Build
 
