@@ -18,6 +18,8 @@ const benchmark_requests_per_sample: usize = benchmark_workers * benchmark_calls
 const benchmark_observation_count: usize = benchmark_repetitions * benchmark_requests_per_sample;
 const benchmark_idle_ms: u64 = 2000;
 const benchmark_report_path: [*:0]const u8 = "C:\\TEMP\\SVCBENCH.TXT";
+const isolation_service_name = "TIMESVC";
+const isolation_probe_requests: usize = 32;
 
 const op_echo: u16 = 1;
 const op_status: u16 = 2;
@@ -371,6 +373,7 @@ fn runBenchmark(ctx: *const r4os.r4sys.Context, services: *const r4os.Services, 
     }
 
     printBenchmarkDistribution(ctx, summarize(all_queue[0..all_offset]), summarize(all_e2e[0..all_offset]));
+    if (!runEndpointIsolationScenario(ctx, services)) return benchmarkFail(ctx, 13);
     if (keep_endpoint) {
         benchmark_sys = null;
         benchmark_services = null;
@@ -461,6 +464,94 @@ fn benchmarkWorkerMain(raw_worker: u64) callconv(.c) i32 {
     }
     _ = connection.close();
     return 0;
+}
+
+fn runEndpointIsolationScenario(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) bool {
+    var secondary = waitServiceOpenName(ctx, services, isolation_service_name, 120) orelse return false;
+    defer _ = secondary.close();
+
+    benchmark_results = .{BenchmarkObservation{}} ** benchmark_requests_per_sample;
+    @atomicStore(u32, &benchmark_ready, 0, .release);
+    @atomicStore(u32, &benchmark_release, 0, .release);
+    var handles: [benchmark_workers]r4os.abi.ProgramJoinHandle = .{r4os.abi.ProgramJoinHandle{}} ** benchmark_workers;
+    var created: usize = 0;
+    while (created < handles.len) : (created += 1) {
+        if (ctx.threadCreateHandle(benchmarkWorkerMain, created, 0, 0, &handles[created]) != r4os.abi.thread_ok) {
+            @atomicStore(u32, &benchmark_release, 1, .release);
+            joinBenchmarkWorkers(ctx, handles[0..created]);
+            return false;
+        }
+    }
+    var ready_rounds: u32 = 0;
+    while (@atomicLoad(u32, &benchmark_ready, .acquire) != benchmark_workers and ready_rounds < 100_000) : (ready_rounds += 1)
+        ctx.taskYield();
+    if (@atomicLoad(u32, &benchmark_ready, .acquire) != benchmark_workers) {
+        @atomicStore(u32, &benchmark_release, 1, .release);
+        joinBenchmarkWorkers(ctx, handles[0..]);
+        return false;
+    }
+
+    printIsolationMetadata(ctx);
+    const background_started = ctx.monotonicNanoseconds() orelse {
+        @atomicStore(u32, &benchmark_release, 1, .release);
+        joinBenchmarkWorkers(ctx, handles[0..]);
+        return false;
+    };
+    @atomicStore(u32, &benchmark_release, 1, .release);
+    var probe_values: [isolation_probe_requests]u64 = .{0} ** isolation_probe_requests;
+    var probe_failures: u32 = 0;
+    var probe: usize = 0;
+    while (probe < probe_values.len) : (probe += 1) {
+        const started = ctx.monotonicNanoseconds() orelse {
+            probe_failures +%= 1;
+            printIsolationRaw(ctx, probe, 0, 1);
+            continue;
+        };
+        var response: [@sizeOf(r4os.abi.TimeServiceStatus)]u8 = undefined;
+        const call = secondary.call(
+            r4os.abi.time_service_op_status,
+            "",
+            response[0..],
+            r4os.time_contract.timeoutFinite(r4os.time_contract.durationFromNanoseconds(2_000_000_000)),
+        );
+        const completed = ctx.monotonicNanoseconds() orelse {
+            probe_failures +%= 1;
+            printIsolationRaw(ctx, probe, 0, 2);
+            continue;
+        };
+        const ok = switch (call) {
+            .response => |value| value.bytes == response.len and value.header.status == r4os.abi.service_api_result_ok,
+            else => false,
+        };
+        if (!ok or completed < started) {
+            probe_failures +%= 1;
+            printIsolationRaw(ctx, probe, 0, 3);
+            continue;
+        }
+        probe_values[probe] = completed - started;
+        printIsolationRaw(ctx, probe, probe_values[probe], 0);
+    }
+
+    var worker_failures: u32 = 0;
+    for (handles[0..]) |*handle| {
+        var exit_code: i32 = -1;
+        if (ctx.threadHandleJoin(handle, r4os.abi.thread_wait_forever, &exit_code) != r4os.abi.thread_ok or exit_code != 0)
+            worker_failures +%= 1;
+    }
+    const background_completed = ctx.monotonicNanoseconds() orelse return false;
+    var observation_failures: u32 = 0;
+    for (benchmark_results) |observation| {
+        if (observation.failure != 0) observation_failures +%= 1;
+    }
+    printIsolationDistribution(
+        ctx,
+        summarize(probe_values[0..]),
+        background_completed -| background_started,
+        probe_failures,
+        worker_failures,
+        observation_failures,
+    );
+    return probe_failures == 0 and worker_failures == 0 and observation_failures == 0;
 }
 
 fn markBenchmarkWorkerFailure(worker: usize, failure: i32) void {
@@ -803,6 +894,55 @@ fn printBenchmarkDistribution(ctx: *const r4os.r4sys.Context, queue: Distributio
     emitBenchmarkLine(ctx, line, false);
 }
 
+fn printIsolationMetadata(ctx: *const r4os.r4sys.Context) void {
+    var line_buffer: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        line_buffer[0..],
+        "SVCISOM|1|{d}|{d}|{d}|{d}",
+        .{ benchmark_workers, benchmark_calls_per_worker, benchmark_requests_per_sample, isolation_probe_requests },
+    ) catch return;
+    emitBenchmarkLine(ctx, line, false);
+}
+
+fn printIsolationRaw(ctx: *const r4os.r4sys.Context, probe: usize, elapsed_ns: u64, failure: i32) void {
+    var line_buffer: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        line_buffer[0..],
+        "SVCISOR|1|{d}|{d}|{d}",
+        .{ probe + 1, elapsed_ns, failure },
+    ) catch return;
+    emitBenchmarkLine(ctx, line, false);
+}
+
+fn printIsolationDistribution(
+    ctx: *const r4os.r4sys.Context,
+    latency: Distribution,
+    background_elapsed_ns: u64,
+    probe_failures: u32,
+    worker_failures: u32,
+    observation_failures: u32,
+) void {
+    var line_buffer: [320]u8 = undefined;
+    const line = std.fmt.bufPrint(
+        line_buffer[0..],
+        "SVCISOD|1|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}|{d}",
+        .{
+            isolation_probe_requests,
+            latency.minimum,
+            latency.p50,
+            latency.p95,
+            latency.p99,
+            latency.maximum,
+            latency.mean,
+            background_elapsed_ns,
+            probe_failures,
+            worker_failures,
+            observation_failures,
+        },
+    ) catch return;
+    emitBenchmarkLine(ctx, line, false);
+}
+
 fn emitBenchmarkLine(ctx: *const r4os.r4sys.Context, line: []const u8, reset: bool) void {
     ctx.println(line);
     var file_buffer: [514]u8 = undefined;
@@ -865,15 +1005,19 @@ fn cleanupService(ctx: *const r4os.r4sys.Context) void {
 }
 
 fn waitServiceOpen(ctx: *const r4os.r4sys.Context, services: *const r4os.Services, max_ticks: u32) ?r4os.ServiceConnection {
+    return waitServiceOpenName(ctx, services, service_name, max_ticks);
+}
+
+fn waitServiceOpenName(ctx: *const r4os.r4sys.Context, services: *const r4os.Services, name: [*:0]const u8, max_ticks: u32) ?r4os.ServiceConnection {
     var tick: u32 = 0;
     while (tick < max_ticks) : (tick += 1) {
-        switch (services.open(service_name)) {
+        switch (services.open(name)) {
             .connection => |value| return value,
             .failure => {},
         }
         ctx.sleepTicks(1);
     }
-    return switch (services.open(service_name)) {
+    return switch (services.open(name)) {
         .connection => |value| value,
         .failure => null,
     };
