@@ -8,19 +8,20 @@ Projektstruktur seit 0.51.19:
 - `build.zig.zon` bindet `r4os_sdk` als Paket.
 - `module.R4MF` beschreibt Artefakt, Zielpfad, Imports, Startdaten und Contract.
 
-Build:
+Build aus dem Repository `Repositories/Services/ExampleService`:
 
-    cd Code\System\Services\ExampleService
-    ..\..\..\DevTools\Zig\zig.exe build
+    Windows: Build.bat
+    Linux:   ./Build.sh
 
-Ergebnis:
+Die Starter loesen Toolchain und lokale SDK-Abhaengigkeiten ueber
+`Settings.R4S` auf. Das Ergebnis liegt im Repository unter:
 
-    Code\System\Services\ExampleService\zig-out\EXSVC.R4X
+    zig-out/EXSVC.R4X
 
 Contract:
-- R4XStart-Entry: `exsvc_main`
+- App-Einstieg: `r4_app_main`; `ENTRY_MODE=app` erzeugt den SDK-Startwrapper.
 - App-Klasse: `service`
-- R4L-Imports: `R4SYS`
+- Eingebaute Plattform-API: `R4SYS:Query:1`
 - Service-Name: `EXSVC`
 - Standardargumente: `/RUN`
 - Zielpfad im Image: `C:\R4OS\SERVICES\EXSVC.R4X`
