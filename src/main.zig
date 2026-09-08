@@ -180,21 +180,21 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint
     stats.requests +%= 1;
     if (message.header.op == op_echo) {
         stats.echoes +%= 1;
-        return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_ok, payload[0..message.bytes]);
+        return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_ok, payload[0..message.bytes]);
     }
     if (message.header.op == op_status) {
         stats.status +%= 1;
-        return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_ok, "EXSVC OK");
+        return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_ok, "EXSVC OK");
     }
     if (message.header.op == op_benchmark) {
         if (message.bytes != @sizeOf(BenchmarkRequest))
-            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_invalid, "SIZE");
+            return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_invalid, "SIZE");
         var request: BenchmarkRequest = undefined;
         @memcpy(std.mem.asBytes(&request), payload[0..@sizeOf(BenchmarkRequest)]);
         if (request.magic != benchmark_magic)
-            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_invalid, "MAGIC");
+            return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_invalid, "MAGIC");
         const received_ns = ctx.monotonicNanoseconds() orelse
-            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_invalid, "CLOCK");
+            return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_invalid, "CLOCK");
         stats.benchmarks +%= 1;
         const response = BenchmarkResponse{
             .worker = request.worker,
@@ -202,15 +202,15 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint
             .sent_ns = request.sent_ns,
             .received_ns = received_ns,
         };
-        return endpoint.replyTyped(BenchmarkResponse, message.header.request_id, r4os.abi.service_api_result_ok, &response);
+        return endpoint.replyTypedIfPending(BenchmarkResponse, message.header.request_id, r4os.abi.service_api_result_ok, &response);
     }
     if (message.header.op == op_completion_batch) {
         if (message.bytes != @sizeOf(CompletionRequest))
-            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_invalid, "SIZE");
+            return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_invalid, "SIZE");
         var request: CompletionRequest = undefined;
         @memcpy(std.mem.asBytes(&request), payload[0..@sizeOf(CompletionRequest)]);
         if (request.magic != completion_magic or request.client_index >= completion_request_count)
-            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_invalid, "REQUEST");
+            return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_invalid, "REQUEST");
 
         const arrival_order = stats.completion_seen;
         stats.completion_seen +%= 1;
@@ -220,10 +220,10 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint
                 .arrival_order = arrival_order,
                 .reply_order = arrival_order,
             };
-            return endpoint.replyTyped(CompletionResponse, message.header.request_id, r4os.abi.service_api_result_ok, &response);
+            return endpoint.replyTypedIfPending(CompletionResponse, message.header.request_id, r4os.abi.service_api_result_ok, &response);
         }
         if (stats.completion_pending >= stats.completion_requests.len)
-            return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_busy, "FULL");
+            return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_busy, "FULL");
         stats.completion_requests[stats.completion_pending] = .{
             .request_id = message.header.request_id,
             .client_index = request.client_index,
@@ -246,7 +246,7 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint
                 .arrival_order = pending.arrival_order,
                 .reply_order = reply_order,
             };
-            const rc = endpoint.replyTyped(CompletionResponse, pending.request_id, r4os.abi.service_api_result_ok, &response);
+            const rc = endpoint.replyTypedIfPending(CompletionResponse, pending.request_id, r4os.abi.service_api_result_ok, &response);
             if (rc < 0) return rc;
             reply_order += 1;
         }
@@ -256,7 +256,7 @@ fn handleRequest(ctx: *const r4os.r4sys.Context, endpoint: *r4os.ServiceEndpoint
     }
     if (message.header.op == op_no_reply) return 0;
     stats.bad_ops +%= 1;
-    return endpoint.reply(message.header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
+    return endpoint.replyIfPending(message.header.request_id, r4os.abi.service_api_result_bad_op, "BADOP");
 }
 
 fn runPingClient(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i32 {
