@@ -14,20 +14,22 @@ Build aus dem Repository `Repositories/Services/ExampleService`:
     Linux:   ./Build.sh
 
 Die Starter loesen Toolchain und lokale SDK-Abhaengigkeiten ueber
-`Settings.R4S` auf. Das Ergebnis liegt im Repository unter:
+`Settings.R4S` auf. Das Ergebnis liegt im Workspace unter:
 
-    zig-out/EXSVC.R4X
+    Artifacts/Modules/ExampleService/EXSVC.R4X
 
 Contract:
 - App-Einstieg: `r4_app_main`; `ENTRY_MODE=app` erzeugt den SDK-Startwrapper.
 - App-Klasse: `service`
-- Eingebaute Plattform-API: `R4SYS:Query:1`
+- Eingebaute Plattform-API: `R4SYS:Query2:2` mit `R4XStart2:2`
 - Service-Name: `EXSVC`
 - Standardargumente: `/RUN`
 - Zielpfad im Image: `C:\R4OS\SERVICES\EXSVC.R4X`
 
 Service-Loop seit 0.69.6:
 - `/RUN` verwendet den gemeinsamen SDK-Baustein `r4os.ServiceLoop`.
+- Die Anmeldung nutzt eine gemeinsame Frist. Der Selbsttest beobachtet
+  Neustart und Stopp anhand des vollen Prozesshandles.
 - Endpoint-Wait, kontrollierter Stopcheck und begrenztes Queue-Draining sind
   zentral; EXSVC besitzt keine Ein-Tick-Leerlaufpollschleife mehr.
 - Das Drainbudget ist auf die acht Endpointslots begrenzt und erzwingt keinen

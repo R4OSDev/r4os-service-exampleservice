@@ -9,8 +9,6 @@ const ping_arg = "/PING";
 const benchmark_arg = "/BENCHMARK";
 const benchmark_keep_arg = "/KEEP";
 const benchmark_keep_service_arg = "/BENCHMARKKEEP";
-const inventory_restart_limit: u32 = 16;
-const inventory_would_block_retry_limit: u32 = 64;
 const benchmark_repetitions: usize = 5;
 const benchmark_workers: usize = 8;
 const benchmark_calls_per_worker: usize = 8;
@@ -97,74 +95,48 @@ const ServiceStats = struct {
     bad_ops: u32 = 0,
 };
 
-pub fn r4_app_main(app: *r4os.App) i32 {
+pub fn r4_app_main(app: *r4os.App2) i32 {
     const ctx = app.system();
     const services = app.services() orelse return r4os.abi.service_api_result_invalid;
-    const benchmark_requested = hasArg(app.args(), benchmark_arg) or hasArg(app.args(), benchmark_keep_service_arg);
+    const args = parseArgs(app.args()) catch |err| return r4os.arguments.code(err);
     // Service-class binaries may only be launched interactively through the
     // Terminal's explicit selftest policy. The combined test-harness form
     // keeps the benchmark a console-owned process without changing /RUN.
-    if (benchmark_requested and hasArg(app.args(), selftest_arg)) {
-        return runBenchmark(
-            &ctx,
-            &services,
-            hasArg(app.args(), benchmark_keep_arg) or hasArg(app.args(), benchmark_keep_service_arg),
-        );
-    }
-    if (hasArg(app.args(), selftest_arg)) return runSelfTest(&ctx, &services);
-    if (hasArg(app.args(), ping_arg)) return runPingClient(&ctx, &services);
-    if (benchmark_requested) {
-        return runBenchmark(
-            &ctx,
-            &services,
-            hasArg(app.args(), benchmark_keep_arg) or hasArg(app.args(), benchmark_keep_service_arg),
-        );
-    }
+    if (args.benchmark and args.selftest) return runBenchmark(&ctx, &services, args.keep);
+    if (args.selftest) return runSelfTest(&ctx, &services);
+    if (args.ping) return runPingClient(&ctx, &services);
+    if (args.benchmark) return runBenchmark(&ctx, &services, args.keep);
     return runService(&ctx, &services);
 }
 
 fn runService(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i32 {
-    var endpoint: ?r4os.ServiceEndpoint = null;
-    var waited: u32 = 0;
-    while (waited < 100 and endpoint == null) : (waited += 1) {
-        switch (services.register(service_name, 0)) {
-            .endpoint => |value| {
-                endpoint = value;
-                ctx.write("EXSVC endpoint handle=");
-                ctx.printU64(@intCast(value.raw));
-                ctx.println("");
-            },
-            .failure => {},
-        }
-        ctx.sleepTicks(1);
-    }
-    if (endpoint == null) {
-        ctx.println("EXSVC endpoint registration failed");
-        return r4os.abi.service_api_result_no_endpoint;
-    }
-
-    var owned_endpoint = endpoint.?;
+    var budget = tickBudget(ctx, 100) catch |err| return r4os.rpc_budget.code(err);
+    var owned_endpoint = switch (r4os.app_services.registerUntil(services, service_name, 0, &budget)) {
+        .endpoint => |value| value,
+        .failure => |raw| {
+            ctx.println("EXSVC endpoint registration failed");
+            return raw;
+        },
+    };
+    ctx.write("EXSVC endpoint handle=");
+    ctx.printU64(owned_endpoint.raw);
+    ctx.println("");
+    defer _ = owned_endpoint.unregister();
     var stats: ServiceStats = .{};
     var service_loop = r4os.ServiceLoop.init(ctx.*, owned_endpoint.raw, .{});
     while (true) {
         switch (service_loop.wait(null)) {
             .requests => |pending| {
                 const rc = service_loop.drain(pending, handleRequest, .{ ctx, &owned_endpoint, &stats });
-                if (rc >= 0) continue;
-                _ = owned_endpoint.unregister();
-                return rc;
+                if (rc < 0) return rc;
             },
             .idle, .deadline => {},
             .stop => break,
-            .failure => |raw| {
-                _ = owned_endpoint.unregister();
-                return raw;
-            },
+            .failure => |raw| return raw,
         }
     }
 
     service_loop.report(service_name);
-    _ = owned_endpoint.unregister();
     ctx.println("EXSVC stopped cleanly");
     return 0;
 }
@@ -318,7 +290,7 @@ fn runBenchmark(ctx: *const r4os.r4sys.Context, services: *const r4os.Services, 
             rc = ctx.threadCreateHandle(benchmarkWorkerMain, created, 0, 0, &handles[created]);
             if (rc != r4os.abi.thread_ok) {
                 @atomicStore(u32, &benchmark_release, 1, .release);
-                joinBenchmarkWorkers(ctx, handles[0..created]);
+                _ = joinBenchmarkWorkers(ctx, handles[0..created]);
                 return benchmarkFail(ctx, 5);
             }
         }
@@ -328,23 +300,18 @@ fn runBenchmark(ctx: *const r4os.r4sys.Context, services: *const r4os.Services, 
             ctx.taskYield();
         if (@atomicLoad(u32, &benchmark_ready, .acquire) != benchmark_workers) {
             @atomicStore(u32, &benchmark_release, 1, .release);
-            joinBenchmarkWorkers(ctx, handles[0..]);
+            _ = joinBenchmarkWorkers(ctx, handles[0..]);
             return benchmarkFail(ctx, 6);
         }
 
         const started_ns = ctx.monotonicNanoseconds() orelse {
             @atomicStore(u32, &benchmark_release, 1, .release);
-            joinBenchmarkWorkers(ctx, handles[0..]);
+            _ = joinBenchmarkWorkers(ctx, handles[0..]);
             return benchmarkFail(ctx, 7);
         };
         @atomicStore(u32, &benchmark_release, 1, .release);
 
-        var worker_failures: u32 = 0;
-        for (handles[0..]) |*handle| {
-            var exit_code: i32 = -1;
-            if (ctx.threadHandleJoin(handle, r4os.abi.thread_wait_forever, &exit_code) != r4os.abi.thread_ok or exit_code != 0)
-                worker_failures +%= 1;
-        }
+        const worker_failures = joinBenchmarkWorkers(ctx, &handles);
         const completed_ns = ctx.monotonicNanoseconds() orelse return benchmarkFail(ctx, 8);
         const elapsed_ns = completed_ns -| started_ns;
 
@@ -478,7 +445,7 @@ fn runEndpointIsolationScenario(ctx: *const r4os.r4sys.Context, services: *const
     while (created < handles.len) : (created += 1) {
         if (ctx.threadCreateHandle(benchmarkWorkerMain, created, 0, 0, &handles[created]) != r4os.abi.thread_ok) {
             @atomicStore(u32, &benchmark_release, 1, .release);
-            joinBenchmarkWorkers(ctx, handles[0..created]);
+            _ = joinBenchmarkWorkers(ctx, handles[0..created]);
             return false;
         }
     }
@@ -487,14 +454,14 @@ fn runEndpointIsolationScenario(ctx: *const r4os.r4sys.Context, services: *const
         ctx.taskYield();
     if (@atomicLoad(u32, &benchmark_ready, .acquire) != benchmark_workers) {
         @atomicStore(u32, &benchmark_release, 1, .release);
-        joinBenchmarkWorkers(ctx, handles[0..]);
+        _ = joinBenchmarkWorkers(ctx, handles[0..]);
         return false;
     }
 
     printIsolationMetadata(ctx);
     const background_started = ctx.monotonicNanoseconds() orelse {
         @atomicStore(u32, &benchmark_release, 1, .release);
-        joinBenchmarkWorkers(ctx, handles[0..]);
+        _ = joinBenchmarkWorkers(ctx, handles[0..]);
         return false;
     };
     @atomicStore(u32, &benchmark_release, 1, .release);
@@ -532,12 +499,7 @@ fn runEndpointIsolationScenario(ctx: *const r4os.r4sys.Context, services: *const
         printIsolationRaw(ctx, probe, probe_values[probe], 0);
     }
 
-    var worker_failures: u32 = 0;
-    for (handles[0..]) |*handle| {
-        var exit_code: i32 = -1;
-        if (ctx.threadHandleJoin(handle, r4os.abi.thread_wait_forever, &exit_code) != r4os.abi.thread_ok or exit_code != 0)
-            worker_failures +%= 1;
-    }
+    const worker_failures = joinBenchmarkWorkers(ctx, &handles);
     const background_completed = ctx.monotonicNanoseconds() orelse return false;
     var observation_failures: u32 = 0;
     for (benchmark_results) |observation| {
@@ -560,11 +522,19 @@ fn markBenchmarkWorkerFailure(worker: usize, failure: i32) void {
         observation.failure = failure;
 }
 
-fn joinBenchmarkWorkers(ctx: *const r4os.r4sys.Context, handles: []r4os.abi.ProgramJoinHandle) void {
+fn joinBenchmarkWorkers(ctx: *const r4os.r4sys.Context, handles: []r4os.abi.ProgramJoinHandle) u32 {
+    var failures: u32 = 0;
     for (handles) |*handle| {
         var exit_code: i32 = -1;
-        _ = ctx.threadHandleJoin(handle, r4os.abi.thread_wait_forever, &exit_code);
+        var exact = handle.*;
+        while (ctx.threadHandleJoin(&exact, r4os.abi.thread_wait_forever, &exit_code) != r4os.abi.thread_ok) {
+            ctx.sleepTicks(1);
+            exact = handle.*;
+        }
+        handle.* = .{};
+        if (exit_code != 0) failures += 1;
     }
+    return failures;
 }
 
 fn benchmarkFail(ctx: *const r4os.r4sys.Context, code: u32) i32 {
@@ -599,7 +569,7 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i
 
     rc = ctx.serviceStart(service_name, &info);
     if (rc != r4os.abi.service_api_result_ok or info.state != r4os.abi.service_state_running or info.instance_id == 0) return failCode(ctx, "start", rc);
-    const first_instance = info.instance_id;
+    const first_process = serviceProcess(ctx, info.instance_id) orelse return fail(ctx, "first-process-identity");
 
     var connection = waitServiceOpen(ctx, services, 120) orelse return fail(ctx, "open");
     if (!callEcho(&connection, "EXSVC-0.22.6")) return fail(ctx, "echo");
@@ -610,8 +580,9 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i
 
     rc = ctx.serviceRestart(service_name, &info);
     if (rc != r4os.abi.service_api_result_ok or info.state != r4os.abi.service_state_running or info.instance_id == 0 or info.restart_count == 0) return failCode(ctx, "restart", rc);
-    if (!waitInstanceGone(ctx, first_instance, 120)) return fail(ctx, "first-instance-stale");
-    const second_instance = info.instance_id;
+    if (!waitInstanceGone(ctx, first_process, 120)) return fail(ctx, "first-instance-stale");
+    const second_process = serviceProcess(ctx, info.instance_id) orelse return fail(ctx, "second-process-identity");
+    if (std.meta.eql(first_process, second_process)) return fail(ctx, "restart-generation");
 
     connection = waitServiceOpen(ctx, services, 120) orelse return fail(ctx, "open-after-restart");
     if (!callEcho(&connection, "RESTART-OK")) return fail(ctx, "echo-after-restart");
@@ -625,21 +596,23 @@ fn runSelfTest(ctx: *const r4os.r4sys.Context, services: *const r4os.Services) i
         "STOP",
         &stop_header,
         stop_response[0..],
-        r4os.abi.io_wait_forever,
+        ctx.ticksFromMilliseconds(3000),
         0,
         &stop_request_id,
     );
     if (stop_submit != r4os.abi.io_ok or stop_request_id == 0) return fail(ctx, "stop-wait-submit");
+    defer if (stop_request_id != 0) retireCompletionRequest(ctx, stop_request_id);
     ctx.sleepTicks(ctx.ticksFromMilliseconds(20));
 
-    rc = ctx.serviceStop(service_name, &info, 80);
+    rc = ctx.serviceStopBound(service_name, &second_process, &info, 80);
     if (rc != r4os.abi.service_api_result_ok or info.state != r4os.abi.service_state_stopped) return failCode(ctx, "stop", rc);
-    if (!waitInstanceGone(ctx, second_instance, 120)) return fail(ctx, "second-instance-stale");
+    if (!waitInstanceGone(ctx, second_process, 120)) return fail(ctx, "second-instance-stale");
     var stop_io: r4os.abi.ProgramIoInfo = .{};
     const stop_wait = ctx.ioWait(stop_request_id, r4os.abi.io_wait_forever, &stop_io);
     const stop_result_ok = stop_io.result == r4os.abi.service_api_result_bad_handle or
         stop_io.result == r4os.abi.service_api_result_not_running;
-    _ = ctx.ioClose(stop_request_id);
+    retireCompletionRequest(ctx, stop_request_id);
+    stop_request_id = 0;
     if (stop_wait != r4os.abi.io_ok or stop_io.state != r4os.abi.io_state_completed or !stop_result_ok)
         return failCode(ctx, "stop-wait-result", stop_io.result);
 
@@ -706,7 +679,7 @@ fn runCompletionScenario(ctx: *const r4os.r4sys.Context, connection: *r4os.Servi
             headers[index].status != r4os.abi.service_api_result_ok or
             responses[index].magic != completion_magic or
             responses[index].client_index != @as(u32, @intCast(index))) ok = false;
-        _ = ctx.ioClose(io_ids[index]);
+        retireCompletionRequest(ctx, io_ids[index]);
     }
 
     var arrivals: [completion_request_count]bool = .{false} ** completion_request_count;
@@ -744,10 +717,17 @@ fn runCompletionScenario(ctx: *const r4os.r4sys.Context, connection: *r4os.Servi
 
 fn closeCompletionRequests(ctx: *const r4os.r4sys.Context, request_ids: []const u32) void {
     for (request_ids) |request_id| {
-        if (request_id == 0) continue;
+        if (request_id != 0) retireCompletionRequest(ctx, request_id);
+    }
+}
+
+fn retireCompletionRequest(ctx: *const r4os.r4sys.Context, request_id: u32) void {
+    while (true) {
         var info: r4os.abi.ProgramIoInfo = .{};
         _ = ctx.ioWait(request_id, ctx.ticksFromMilliseconds(500), &info);
-        _ = ctx.ioClose(request_id);
+        if (ctx.ioClose(request_id) == r4os.abi.io_ok) return;
+        // Caller buffers remain live through real request retirement.
+        ctx.sleepTicks(1);
     }
 }
 
@@ -1009,89 +989,40 @@ fn waitServiceOpen(ctx: *const r4os.r4sys.Context, services: *const r4os.Service
 }
 
 fn waitServiceOpenName(ctx: *const r4os.r4sys.Context, services: *const r4os.Services, name: [*:0]const u8, max_ticks: u32) ?r4os.ServiceConnection {
-    var tick: u32 = 0;
-    while (tick < max_ticks) : (tick += 1) {
-        switch (services.open(name)) {
-            .connection => |value| return value,
-            .failure => {},
-        }
-        ctx.sleepTicks(1);
-    }
-    return switch (services.open(name)) {
+    var budget = tickBudget(ctx, max_ticks) catch return null;
+    return switch (r4os.app_services.openUntil(services, name, &budget)) {
         .connection => |value| value,
         .failure => null,
     };
 }
 
-fn waitInstanceGone(ctx: *const r4os.r4sys.Context, id: u32, max_ticks: u32) bool {
-    var tick: u32 = 0;
-    while (tick < max_ticks) : (tick += 1) {
-        if (!instanceExists(ctx, id)) return true;
-        ctx.sleepTicks(1);
-    }
-    return !instanceExists(ctx, id);
+fn serviceProcess(ctx: *const r4os.r4sys.Context, expected_id: u32) ?r4os.abi.ProgramProcessHandle {
+    var detail: r4os.abi.ServiceDetail = .{};
+    var handle: r4os.abi.ProgramProcessHandle = .{};
+    if (ctx.serviceBoundDetail(service_name, &detail, &handle) != r4os.abi.service_api_result_ok or
+        handle.instance_id != expected_id or handle.generation == 0 or handle.reserved != 0) return null;
+    return handle;
 }
 
-fn instanceExists(ctx: *const r4os.r4sys.Context, id: u32) bool {
-    var attempt: u32 = 0;
-    restart: while (attempt < inventory_restart_limit) : (attempt += 1) {
-        var cursor: r4os.abi.ProgramInventoryCursor = .{};
-        var summary: r4os.abi.ProgramInventorySummary = .{};
-        if (!beginProgramInventory(ctx, &cursor, &summary)) return true;
-        while (true) {
-            var entries: [@as(usize, r4os.abi.program_inventory_page_max)]r4os.abi.ProgramInstanceSnapshot = undefined;
-            var page: r4os.abi.ProgramInventoryPageInfo = .{};
-            if (!readProgramInventoryPage(ctx, &cursor, entries[0..], &page)) return true;
-            if (page.status == r4os.abi.program_inventory_status_restart) continue :restart;
-            if (page.returned > entries.len or page.snapshot_generation != cursor.snapshot_generation) return true;
-            for (entries[0..@intCast(page.returned)]) |entry| {
-                if (entry.info.id == id) return true;
-            }
-            if (page.status == r4os.abi.program_inventory_status_complete) return false;
-            if (page.status != r4os.abi.program_inventory_status_more or page.returned == 0) return true;
+fn waitInstanceGone(ctx: *const r4os.r4sys.Context, handle: r4os.abi.ProgramProcessHandle, max_ticks: u32) bool {
+    var budget = tickBudget(ctx, max_ticks) catch return false;
+    while (!ctx.programShouldClose()) {
+        _ = budget.remainingTicks() catch return false;
+        var info: r4os.abi.ProgramInstanceInfo = .{};
+        switch (ctx.programHandleStatus(&handle, &info)) {
+            r4os.abi.program_handle_error_not_found, r4os.abi.program_handle_error_stale => return true,
+            r4os.abi.program_handle_ok, r4os.abi.program_handle_error_would_block => {},
+            else => return false,
         }
-    }
-    // An unstable inventory must not be mistaken for a completed stop.
-    return true;
-}
-
-fn beginProgramInventory(
-    ctx: *const r4os.r4sys.Context,
-    cursor: *r4os.abi.ProgramInventoryCursor,
-    summary: *r4os.abi.ProgramInventorySummary,
-) bool {
-    var retry: u32 = 0;
-    while (retry <= inventory_would_block_retry_limit) : (retry += 1) {
-        cursor.* = .{};
-        summary.* = .{};
-        const status = ctx.programInventoryBegin(cursor, summary);
-        if (status == r4os.abi.program_handle_ok) return true;
-        if (status != r4os.abi.program_handle_error_would_block or retry == inventory_would_block_retry_limit)
-            return false;
         ctx.sleepTicks(1);
     }
     return false;
 }
 
-fn readProgramInventoryPage(
-    ctx: *const r4os.r4sys.Context,
-    cursor: *r4os.abi.ProgramInventoryCursor,
-    entries: []r4os.abi.ProgramInstanceSnapshot,
-    page: *r4os.abi.ProgramInventoryPageInfo,
-) bool {
-    var retry: u32 = 0;
-    while (retry <= inventory_would_block_retry_limit) : (retry += 1) {
-        const cursor_before = cursor.*;
-        page.* = .{};
-        const status = ctx.programInventoryPrograms(cursor, entries, page);
-        if (status == r4os.abi.program_handle_ok) return true;
-        cursor.* = cursor_before;
-        page.* = .{};
-        if (status != r4os.abi.program_handle_error_would_block or retry == inventory_would_block_retry_limit)
-            return false;
-        ctx.sleepTicks(1);
-    }
-    return false;
+fn tickBudget(ctx: *const r4os.r4sys.Context, ticks: u32) r4os.rpc_budget.Error!r4os.rpc_budget.Budget {
+    const actual = ctx.base.generation2 orelse return error.ClockUnavailable;
+    const clock = r4os.inventory_reader.PlatformClock.fromContext2(actual) catch return error.ClockUnavailable;
+    return r4os.rpc_budget.Budget.fromTicks(clock.read, ticks);
 }
 
 fn fail(ctx: *const r4os.r4sys.Context, label: []const u8) i32 {
@@ -1111,15 +1042,24 @@ fn failCode(ctx: *const r4os.r4sys.Context, label: []const u8, code: i32) i32 {
     return 1;
 }
 
-fn hasArg(args: []const u8, wanted: []const u8) bool {
-    var offset: usize = 0;
-    while (offset < args.len and args[offset] != 0) {
-        while (offset < args.len and (args[offset] == ' ' or args[offset] == '\t')) : (offset += 1) {}
-        const start = offset;
-        while (offset < args.len and args[offset] != 0 and args[offset] != ' ' and args[offset] != '\t') : (offset += 1) {}
-        if (equalsIgnoreCase(args[start..offset], wanted)) return true;
+const Arguments = struct { selftest: bool = false, ping: bool = false, benchmark: bool = false, keep: bool = false };
+
+fn parseArgs(args: []const u8) r4os.arguments.Error!Arguments {
+    var result: Arguments = .{};
+    var failure: r4os.arguments.Failure = .{};
+    var cursor = try r4os.arguments.ArgCursor.init(args, .{ .quotes = @intFromEnum(r4os.arguments.Quotes.none) }, &failure);
+    while (try cursor.next()) |token| {
+        const arg = try token.bytes(args);
+        if (std.ascii.eqlIgnoreCase(arg, selftest_arg)) result.selftest = true;
+        if (std.ascii.eqlIgnoreCase(arg, ping_arg)) result.ping = true;
+        if (std.ascii.eqlIgnoreCase(arg, benchmark_arg)) result.benchmark = true;
+        if (std.ascii.eqlIgnoreCase(arg, benchmark_keep_arg)) result.keep = true;
+        if (std.ascii.eqlIgnoreCase(arg, benchmark_keep_service_arg)) {
+            result.benchmark = true;
+            result.keep = true;
+        }
     }
-    return false;
+    return result;
 }
 
 fn spanZ(value: []const u8) []const u8 {
@@ -1135,18 +1075,4 @@ fn bytesEq(a: []const u8, b: []const u8) bool {
         if (a[i] != b[i]) return false;
     }
     return true;
-}
-
-fn equalsIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (upper(a[i]) != upper(b[i])) return false;
-    }
-    return true;
-}
-
-fn upper(ch: u8) u8 {
-    if (ch >= 'a' and ch <= 'z') return ch - ('a' - 'A');
-    return ch;
 }
